@@ -1,0 +1,324 @@
+#!/usr/bin/env bash
+# factory/run: starts factory runs on this Mac and does every GitHub write.
+# The design lives in docs/agents/factory.md. Written for macOS bash 3.2.
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SELF="$REPO_ROOT/factory/run"
+FACTORY_HOME="${FACTORY_HOME:-$HOME/.factory/news}"
+MAX_BUILDS="${FACTORY_MAX_BUILDS:-2}"
+MAX_FAILS="${FACTORY_MAX_FAILS:-3}"
+BASE="${FACTORY_BASE:-main}"
+SETTINGS="$REPO_ROOT/factory/claude-settings.json"
+FAIL_MARK="<!-- factory:fail -->"
+
+RUN_DIR="" WT="" LOG="" LOCK="" RESULT=""
+
+die() { echo "factory: $*" >&2; exit 1; }
+say() { echo "[factory $(date +%H:%M:%S)] $*" >&2; }
+
+usage() {
+  cat <<'EOF'
+Usage: factory/run <command> [number]
+
+  status              what is where
+  dispatch            start builds for ready tickets
+  build <issue>       one Build run
+  review <pr>         one Review run
+  rework <pr>         one Rework run
+  qa <pr>             one QA run
+  retro <pr>          one Retro run on a merged PR
+  tick                one pass over every queue
+  watch [minutes]     tick forever (default every 5 minutes)
+
+Settings (env): FACTORY_MAX_BUILDS=2 FACTORY_MAX_FAILS=3 FACTORY_BASE=main
+                FACTORY_HOME=~/.factory/news FACTORY_KEEP=1 keeps worktrees
+EOF
+}
+
+# ---------- GitHub helpers (all writes go through these) ----------
+
+uri() { jq -rn --arg s "$1" '$s|@uri'; }
+labels_of() { gh api "repos/{owner}/{repo}/issues/$1" --jq '[.labels[].name] | join(" ")'; }
+has_label() { labels_of "$1" | tr ' ' '\n' | grep -qx "$2"; }
+add_label() { gh api -X POST "repos/{owner}/{repo}/issues/$1/labels" -f "labels[]=$2" >/dev/null; }
+rm_label() { gh api -X DELETE "repos/{owner}/{repo}/issues/$1/labels/$(uri "$2")" >/dev/null 2>&1 || true; }
+move_label() { rm_label "$1" "$2"; add_label "$1" "$3"; }
+comment() { gh api -X POST "repos/{owner}/{repo}/issues/$1/comments" -F "body=@-" >/dev/null; }
+open_blockers() { gh api "repos/{owner}/{repo}/issues/$1" --jq '.issue_dependencies_summary.blocked_by // 0'; }
+fail_count() {
+  gh api --paginate "repos/{owner}/{repo}/issues/$1/comments" \
+    --jq ".[] | select(.body | contains(\"$FAIL_MARK\")) | .id" | wc -l | tr -d ' '
+}
+pr_branch() { gh pr view "$1" --json headRefName -q .headRefName; }
+pr_ticket() { gh pr view "$1" --json closingIssuesReferences -q '.closingIssuesReferences[0].number // empty'; }
+pr_state() { gh pr view "$1" --json state -q .state; }
+numbers_with_label() {
+  gh api "repos/{owner}/{repo}/issues?labels=$(uri "$1")&state=open&per_page=100&sort=created&direction=asc" \
+    --jq '.[].number'
+}
+
+# ---------- run plumbing ----------
+
+lock() {
+  mkdir -p "$FACTORY_HOME/locks"
+  LOCK="$FACTORY_HOME/locks/$1"
+  mkdir "$LOCK" 2>/dev/null || die "#$1 already has a run in progress (remove $LOCK if it crashed)"
+}
+
+cleanup() {
+  if [ -n "$WT" ] && [ -d "$WT" ] && [ "${FACTORY_KEEP:-0}" != 1 ]; then
+    git -C "$REPO_ROOT" worktree remove --force "$WT" 2>/dev/null || true
+  fi
+  if [ -n "$LOCK" ]; then rmdir "$LOCK" 2>/dev/null || true; fi
+}
+trap cleanup EXIT
+
+new_run() { # task number
+  local id="$1-$2-$(date +%Y%m%d-%H%M%S)"
+  RUN_DIR="$FACTORY_HOME/runs/$id"
+  WT="$RUN_DIR/worktree"
+  RESULT="$RUN_DIR/result.json"
+  LOG="$FACTORY_HOME/logs/$id.jsonl"
+  mkdir -p "$RUN_DIR" "$FACTORY_HOME/logs"
+  say "run $id (log: $LOG)"
+}
+
+agent_run() { # agent prompt
+  local prompt="$2
+
+Result file: $RESULT
+Run directory: $RUN_DIR"
+  ( cd "$WT" && FACTORY_RESULT="$RESULT" claude -p --agent "$1" \
+      --permission-mode auto --settings "$SETTINGS" \
+      --output-format stream-json --verbose "$prompt" ) >"$LOG" 2>&1 || true
+  [ -s "$RESULT" ] && jq -e . "$RESULT" >/dev/null 2>&1
+}
+
+result() { jq -r ".$1 // empty" "$RESULT"; }
+
+run_checks() {
+  ( cd "$WT" && ./factory/checks.sh ) >"$RUN_DIR/checks.log" 2>&1
+}
+
+# Records a failed review or check on a PR; stops the PR after MAX_FAILS.
+fail_pr() { # pr from-label title body
+  printf '%s\n## %s\n\n%s\n' "$FAIL_MARK" "$3" "$4" | comment "$1"
+  rm_label "$1" "$2"
+  local n; n="$(fail_count "$1")"
+  if [ "$n" -ge "$MAX_FAILS" ]; then
+    add_label "$1" factory:stuck
+    say "PR #$1 failed $n times: factory:stuck, waiting for you"
+  else
+    add_label "$1" factory:rework
+    say "PR #$1 failed ($n/$MAX_FAILS): factory:rework"
+  fi
+}
+
+checks_body() { printf 'The checks failed:\n\n```\n%s\n```\n' "$(tail -n 60 "$RUN_DIR/checks.log")"; }
+
+# ---------- stations ----------
+
+cmd_build() {
+  local n="$1" branch="factory/issue-$1"
+  [ "$(gh issue view "$n" --json state -q .state)" = OPEN ] || die "#$n is not open"
+  has_label "$n" spec && die "#$n is a spec, not a ticket"
+  has_label "$n" ready-for-agent || die "#$n is not labelled ready-for-agent"
+  [ "$(open_blockers "$n")" = 0 ] || die "#$n still has open blockers"
+  [ -z "$(gh pr list --head "$branch" --state open --json number -q '.[].number')" ] || die "#$n already has an open PR"
+  lock "$n"
+
+  move_label "$n" ready-for-agent factory:building
+  gh issue edit "$n" --add-assignee @me >/dev/null
+  new_run build "$n"
+  git -C "$REPO_ROOT" fetch -q origin "$BASE"
+  git -C "$REPO_ROOT" worktree add -q -B "$branch" "$WT" "origin/$BASE"
+
+  if ! agent_run build-lead "Mode: build. Ticket: #$n. Branch: $branch."; then
+    printf '%s\nThe build run ended without a result. Log: `%s`\n' "$FAIL_MARK" "$LOG" | comment "$n"
+    move_label "$n" factory:building factory:stuck
+    die "build of #$n ended without a result"
+  fi
+  if [ "$(result status)" != done ]; then
+    printf 'The factory could not build this ticket:\n\n%s\n' "$(result reason)" | comment "$n"
+    move_label "$n" factory:building factory:stuck
+    say "#$n blocked: factory:stuck"; return 0
+  fi
+  [ "$(git -C "$WT" rev-list --count "origin/$BASE..HEAD")" -gt 0 ] || {
+    echo "The build run reported done but made no commits." | comment "$n"
+    move_label "$n" factory:building factory:stuck; die "#$n: no commits"; }
+
+  git -C "$WT" push -q --force -u origin "$branch"
+  local title body pr
+  title="$(gh issue view "$n" --json title -q .title)"
+  body="$(printf 'Closes #%s\n\n## What changed\n\n%s\n\n---\n_Built by the factory, run `%s`._\n' "$n" "$(result summary)" "$(basename "$RUN_DIR")")"
+  gh pr create --draft --base "$BASE" --head "$branch" --title "$title" --body "$body" >/dev/null
+  pr="$(gh pr view "$branch" --json number -q .number)"
+
+  if run_checks; then
+    add_label "$pr" factory:review
+    say "#$n built: PR #$pr, factory:review"
+  else
+    add_label "$pr" factory:review
+    fail_pr "$pr" factory:review "Checks failed" "$(checks_body)"
+  fi
+}
+
+cmd_review() {
+  local pr="$1" branch ticket
+  [ "$(pr_state "$pr")" = OPEN ] || die "PR #$pr is not open"
+  has_label "$pr" factory:review || die "PR #$pr is not labelled factory:review"
+  lock "$pr"
+  branch="$(pr_branch "$pr")"; ticket="$(pr_ticket "$pr")"
+  new_run review "$pr"
+  git -C "$REPO_ROOT" fetch -q origin "$BASE" "$branch"
+  git -C "$REPO_ROOT" worktree add -q --detach "$WT" "origin/$branch"
+
+  if ! run_checks; then fail_pr "$pr" factory:review "Checks failed" "$(checks_body)"; return 0; fi
+  agent_run review-lead "PR: #$pr. Ticket: #${ticket:-none}. Base: origin/$BASE." \
+    || die "review of PR #$pr ended without a result (log: $LOG)"
+
+  if [ "$(result verdict)" = pass ]; then
+    printf '## Factory review: pass\n\n%s\n' "$(result report)" | comment "$pr"
+    move_label "$pr" factory:review factory:qa
+    say "PR #$pr passed review: factory:qa"
+  else
+    fail_pr "$pr" factory:review "Factory review: fail" "$(result report)"
+  fi
+}
+
+cmd_rework() {
+  local pr="$1" branch ticket
+  [ "$(pr_state "$pr")" = OPEN ] || die "PR #$pr is not open"
+  lock "$pr"
+  branch="$(pr_branch "$pr")"; ticket="$(pr_ticket "$pr")"
+  new_run rework "$pr"
+  git -C "$REPO_ROOT" fetch -q origin "$branch"
+  git -C "$REPO_ROOT" worktree add -q -B "$branch" "$WT" "origin/$branch"
+  local before; before="$(git -C "$WT" rev-parse HEAD)"
+
+  agent_run build-lead "Mode: rework. PR: #$pr. Ticket: #${ticket:-none}. Branch: $branch." \
+    || die "rework of PR #$pr ended without a result (log: $LOG)"
+  if [ "$(result status)" != done ] || [ "$(git -C "$WT" rev-parse HEAD)" = "$before" ]; then
+    printf 'The factory could not rework this PR:\n\n%s\n' "$(result reason)" | comment "$pr"
+    rm_label "$pr" factory:rework; add_label "$pr" factory:stuck
+    say "PR #$pr rework blocked: factory:stuck"; return 0
+  fi
+  git -C "$WT" push -q origin "HEAD:$branch"
+  printf '## Factory rework\n\n%s\n' "$(result summary)" | comment "$pr"
+  rm_label "$pr" factory:rework; rm_label "$pr" ready-for-acceptance; add_label "$pr" factory:review
+  say "PR #$pr reworked: factory:review"
+}
+
+cmd_qa() {
+  local pr="$1" branch ticket
+  [ -f "$REPO_ROOT/.claude/agents/qa.md" ] || die "the qa agent isn't written yet (it needs the stack)"
+  [ "$(pr_state "$pr")" = OPEN ] || die "PR #$pr is not open"
+  has_label "$pr" factory:qa || die "PR #$pr is not labelled factory:qa"
+  lock "$pr"
+  branch="$(pr_branch "$pr")"; ticket="$(pr_ticket "$pr")"
+  new_run qa "$pr"
+  git -C "$REPO_ROOT" fetch -q origin "$branch"
+  git -C "$REPO_ROOT" worktree add -q --detach "$WT" "origin/$branch"
+
+  agent_run qa "PR: #$pr. Ticket: #${ticket:-none}." || die "QA of PR #$pr ended without a result (log: $LOG)"
+  if [ "$(result verdict)" = pass ]; then
+    printf '## QA: pass\n\n%s\n\n## How to test\n\n%s\n' "$(result report)" "$(result how_to_test)" | comment "$pr"
+    move_label "$pr" factory:qa ready-for-acceptance
+    gh pr ready "$pr" >/dev/null
+    say "PR #$pr passed QA: ready-for-acceptance, your turn"
+  else
+    fail_pr "$pr" factory:qa "QA: fail" "$(result report)"
+  fi
+}
+
+cmd_retro() {
+  local pr="$1" branch="factory/retro-$1" ticket
+  [ "$(pr_state "$pr")" = MERGED ] || die "PR #$pr is not merged"
+  lock "retro-$pr"
+  ticket="$(pr_ticket "$pr")"
+  new_run retro "$pr"
+  git -C "$REPO_ROOT" fetch -q origin "$BASE"
+  git -C "$REPO_ROOT" worktree add -q -B "$branch" "$WT" "origin/$BASE"
+
+  agent_run retro "PR: #$pr. Ticket: #${ticket:-none}. Run logs: $FACTORY_HOME/logs" \
+    || die "retro of PR #$pr ended without a result (log: $LOG)"
+  if [ "$(result status)" != done ] || [ "$(git -C "$WT" rev-list --count "origin/$BASE..HEAD")" = 0 ]; then
+    say "retro of PR #$pr: nothing to change"; return 0
+  fi
+  git -C "$WT" push -q --force -u origin "$branch"
+  gh pr create --base "$BASE" --head "$branch" --title "Factory retro after #$pr" \
+    --body "$(printf '%s\n\n---\n_Proposed by the factory retro. Merge only if you agree._\n' "$(result summary)")" >/dev/null
+  add_label "$(gh pr view "$branch" --json number -q .number)" ready-for-acceptance
+  say "retro of PR #$pr opened a PR for you"
+}
+
+cmd_dispatch() {
+  local building slots n started=0
+  building="$(numbers_with_label factory:building | wc -l | tr -d ' ')"
+  slots=$((MAX_BUILDS - building))
+  [ "$slots" -gt 0 ] || { say "$building builds running, the limit is $MAX_BUILDS"; return 0; }
+  for n in $(numbers_with_label ready-for-agent); do
+    [ "$slots" -gt 0 ] || break
+    has_label "$n" spec && continue
+    [ "$(open_blockers "$n")" = 0 ] || continue
+    [ -d "$FACTORY_HOME/locks/$n" ] && continue
+    mkdir -p "$FACTORY_HOME/logs"
+    nohup "$SELF" build "$n" >"$FACTORY_HOME/logs/launch-build-$n.log" 2>&1 &
+    say "started Build for #$n"
+    slots=$((slots - 1)); started=$((started + 1))
+  done
+  [ "$started" -gt 0 ] || say "no ticket is ready to build"
+}
+
+launch_queue() { # label command
+  local n
+  for n in $(numbers_with_label "$1"); do
+    [ -d "$FACTORY_HOME/locks/$n" ] && continue
+    nohup "$SELF" "$2" "$n" >"$FACTORY_HOME/logs/launch-$2-$n.log" 2>&1 &
+    say "started ${2} for PR #$n"
+  done
+}
+
+cmd_tick() {
+  mkdir -p "$FACTORY_HOME/logs"
+  cmd_dispatch
+  launch_queue factory:review review
+  launch_queue factory:rework rework
+  if [ -f "$REPO_ROOT/.claude/agents/qa.md" ]; then launch_queue factory:qa qa; fi
+}
+
+cmd_watch() {
+  local minutes="${1:-5}"
+  say "watching every $minutes minutes (Ctrl-C to stop)"
+  while true; do cmd_tick || true; sleep $((minutes * 60)); done
+}
+
+cmd_status() {
+  local l
+  for l in ready-for-agent factory:building factory:review factory:rework factory:qa ready-for-acceptance factory:stuck; do
+    echo "$l"
+    gh api "repos/{owner}/{repo}/issues?labels=$(uri "$l")&state=open&per_page=100" \
+      --jq '.[] | "  #\(.number) \(.title)"'
+  done
+  if [ -d "$FACTORY_HOME/locks" ] && [ -n "$(ls -A "$FACTORY_HOME/locks" 2>/dev/null)" ]; then
+    echo "running now: $(ls "$FACTORY_HOME/locks" | tr '\n' ' ')"
+  fi
+}
+
+# ---------- main ----------
+
+for c in gh git jq claude; do command -v "$c" >/dev/null || die "missing $c"; done
+cd "$REPO_ROOT"
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  status) cmd_status ;;
+  dispatch) cmd_dispatch ;;
+  tick) cmd_tick ;;
+  watch) cmd_watch "${1:-5}" ;;
+  build|review|rework|qa|retro)
+    [ -n "${1:-}" ] || die "$cmd needs a number"
+    "cmd_$cmd" "${1#\#}" ;;
+  ""|-h|--help|help) usage ;;
+  *) usage; exit 1 ;;
+esac
