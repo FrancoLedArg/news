@@ -12,10 +12,10 @@ We host it ourselves instead of on Vercel or a managed cloud because the client'
 
 ## Consequences
 
-- The database and images exist only on one server, so backups are our responsibility and must be in place before launch. Each night, restic sends a `pg_dump` and the images folder to Cloudflare R2, keeping 7 daily, 4 weekly and 6 monthly copies, with a restore tested before launch.
+- The database and images exist only on one server, so backups must be in place before launch. We use DonWeb's paid "Premium Diario" Cloud Server backup: a copy of the whole server every night, the last 30 kept on storage separate from the server, restored from DonWeb's account panel. A restore is tested before launch. A restore rolls back the whole server, and all copies sit with DonWeb.
 - The app is built on GitHub Actions, not on the VPS. Each push to `main` runs the tests, builds an x86 image and pushes it to GitHub's container registry. The workflow then connects to the VPS over SSH and runs `docker compose pull && docker compose up -d`. A restart causes a few seconds of downtime, which is accepted for now.
 - The site is reachable only through Cloudflare. Caddy uses a Cloudflare Origin Certificate with SSL mode "Full (strict)", and the firewall accepts web traffic only from Cloudflare's IP ranges.
-- Staff login is Payload's built-in auth (sessions, HTTP-only cookies with `secure` set in production, lockout after failed attempts). There is no separate auth library, because readers never log in.
-- Errors go to Sentry's free plan. An external uptime check watches the Home page and the nightly backup, and Docker logs are rotated.
+- Staff log in with a link sent by email (ADR 0009). Readers never log in.
+- Errors go to Sentry's free plan. An external uptime check watches the Home page, and Docker logs are rotated.
 - The server is set up by a script kept in the repo: SSH keys only, a firewall, `unattended-upgrades`, fail2ban and a deploy user that can only run Docker Compose.
 - Everything except Cloudflare and the SSH deploy can be tested on a laptop with the same Docker Compose setup, so the VPS is only rented close to launch.

@@ -35,7 +35,7 @@ Never cut: validation at trust boundaries, error handling that prevents data los
 
 Fetch current library docs with the Context7 MCP (configured in `.mcp.json`; full rule in `.claude/rules/context7.md`) instead of relying on memory.
 
-- **Payload is on the v4 beta (ADR 0002).** Use the unversioned `/payloadcms/payload` ID, which follows Payload's `main` branch and includes the v4 docs and migration guide. The versioned IDs (`v3.x`) describe v3, so don't use them. Where docs disagree, the v4 migration guide wins.
+- **Payload is on stable v3 (ADR 0008).** Use the newest versioned Context7 ID for v3 (for example `/payloadcms/payload/v3.85.0`), not the unversioned `/payloadcms/payload` ID, which follows `main` and describes the v4 beta.
 - For other libraries, use the version ID that matches what's pinned in `package.json` when Context7 has one.
 
 ## Agent skills

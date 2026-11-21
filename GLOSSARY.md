@@ -43,3 +43,9 @@ _Avoid_: Advert, banner, sponsor, campaign
 **Ad slot** (_espacio publicitario_):
 A fixed place on the site's pages where an ad can appear.
 _Avoid_: Placement, zone, position
+
+## Statistics
+
+**Visit** (_visita_):
+One reader opening one page of the site. Staff see visit counts on the statistics page in the admin.
+_Avoid_: View, hit, pageview, read
